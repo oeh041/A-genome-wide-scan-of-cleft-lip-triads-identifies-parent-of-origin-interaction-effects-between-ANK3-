@@ -1,0 +1,960 @@
+---
+title: "Analysis of results"
+author: "Julia Romanowska"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: tactile
+    highlight: github
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+# loading data
+snps.pooled.smoke <- read.table( "pooled_smoke_SNPs.dat", stringsAsFactors = FALSE )
+snps.pooled.vitamin <- read.table( "pooled_vitamin_SNPs.dat", stringsAsFactors = FALSE )
+snps.pooled.alcohol <- read.table( "pooled_alcohol_SNPs.dat", stringsAsFactors = FALSE )
+
+snps.eu.smoke <- read.table( "EU_smoke_SNPs.dat", stringsAsFactors = FALSE )
+snps.eu.vitamin <- read.table( "EU_vitamin_SNPs.dat", stringsAsFactors = FALSE )
+snps.eu.alcohol <- read.table( "EU_alcohol_SNPs.dat", stringsAsFactors = FALSE )
+
+snps.asia.vitamin <- read.table( "Asia_vitamin_SNPs.dat", stringsAsFactors = FALSE )
+
+# loading libraries
+library( ggplot2 )
+library( dplyr )
+library( tidyr )
+library( biomaRt )
+library( clusterProfiler )
+library( org.Hs.eg.db )
+library( ggbio )
+library( GenomicRanges )
+library( Homo.sapiens )
+library( ggraph )
+library( tidygraph )
+library( rjson )
+library( BgeeDB )
+```
+
+# Pre-processing
+
+Some rearranging of tables
+
+```{r table_tidy}
+snps.pooled.alcohol$env.factor <- "alcohol"
+snps.pooled.vitamin$env.factor <- "vitamin"
+snps.pooled.smoke$env.factor <- "smoke"
+
+snps.eu.alcohol$env.factor <- "alcohol"
+snps.eu.vitamin$env.factor <- "vitamin"
+snps.eu.smoke$env.factor <- "smoke"
+
+snps.pooled <- bind_rows( snps.pooled.alcohol, snps.pooled.smoke, snps.pooled.vitamin )
+names( snps.pooled ) <- c( "SNP", "p.value", "env.factor" )
+snps.pooled$population <- "all"
+
+snps.eu <- bind_rows( snps.eu.alcohol, snps.eu.smoke, snps.eu.vitamin )
+names( snps.eu ) <- c( "SNP", "p.value", "env.factor" )
+snps.eu$population <- "European"
+  
+snps.asia <- snps.asia.vitamin
+names( snps.asia ) <- c( "SNP", "p.value" )
+snps.asia$env.factor <- "vitamin"
+snps.asia$population <- "Asia"
+
+snps.all <- bind_rows( snps.pooled, snps.eu, snps.asia )
+# head( snps.all )
+
+unique.snps <- unique( snps.all$SNP )
+```
+
+Here are all the `r length( unique.snps )` unique SNPs:
+
+```{r}
+unique.snps
+```
+
+## Getting the information about the SNPs from ensembl
+
+For later use, it's good to retrieve the newest information from ensembl about each unique SNP.
+
+```{r query_ensembl, cache=TRUE}
+# NB: here, I'm using the GRCh37 version just because the ggbio package does not
+#  provide karyotype plotting for the newer version!
+ensembl.var <- useEnsembl( "snp", dataset = "hsapiens_snp", GRCh = 37 )
+all.attr <- listAttributes( ensembl.var )
+all.filters <- listFilters( ensembl.var )
+my.attrib.var <- c( "refsnp_id", "chr_name", "chrom_start", "allele",
+  "ensembl_gene_stable_id", "ensembl_transcript_stable_id",
+  "distance_to_transcript", "reg_feature_stable_id" )
+my.filters <- "snp_filter"
+
+var.info.found <- lapply( unique.snps, function(x){
+	out <- getBM( attributes = my.attrib.var, filters = my.filters, values = x,
+		mart = ensembl.var )
+	if( nrow( out ) == 0 ){
+		return( NA )
+	}
+	return( out )
+} )
+names( var.info.found ) <- unique.snps
+var.info.found.df <- do.call( rbind, var.info.found )
+
+ensembl.gene <- useEnsembl( "ensembl", dataset = "hsapiens_gene_ensembl", GRCh = 37 )
+my.attrib.gene <- c( "ensembl_gene_id", "external_gene_name" )
+my.filters.gene <- c( "ensembl_gene_id" )
+
+gene.names <- lapply( unique( var.info.found.df$ensembl_gene_stable_id ), function(x){
+  out <- getBM( attributes = my.attrib.gene, filters = my.filters.gene, values = x,
+		mart = ensembl.gene )
+	if( nrow( out ) == 0 ){
+		return( NA )
+	}
+	return( out )
+} )
+which.null <- sapply( gene.names, function(x){
+  all( is.na( x ) )
+} )
+# unique( var.info.found.df$ensembl_gene_stable_id )[ which.null ]
+gene.names <- gene.names[ !which.null ]
+# sapply( gene.names, dim )
+gene.names <- do.call( rbind, gene.names )
+# add to the var.info.found
+var.info.found.df <- left_join( var.info.found.df, gene.names,
+    by = c( "ensembl_gene_stable_id" = "ensembl_gene_id" ) )
+
+# track which stratum the SNPs came from:
+gene.names1 <- distinct( inner_join( gene.names,
+  var.info.found.df[ , c( "refsnp_id", "ensembl_gene_stable_id" ) ],
+  by = c( "ensembl_gene_id" = "ensembl_gene_stable_id" ) ) )
+snps.pooled1 <- left_join( snps.pooled, gene.names1, by = c( "SNP" = "refsnp_id" ) )
+snps.eu1 <- left_join( snps.eu, gene.names1, by = c( "SNP" = "refsnp_id" ) )
+snps.asia1 <- left_join( snps.asia, gene.names1, by = c( "SNP" = "refsnp_id" ) )
+
+write.table( snps.pooled1, file = "SNPs_pooled_info.dat", sep = "\t",
+    quote = FALSE, row.names = FALSE )
+write.table( snps.eu1, file = "SNPs_EU_info.dat", quote = FALSE, sep = "\t",
+    row.names = FALSE )
+write.table( snps.asia1, file = "SNPs_Asia_info.dat", quote = FALSE, sep = "\t",
+    row.names = FALSE )
+```
+
+Those are the attributes retrieved from SNP dataset of ensembl: `r print( my.attrib.var )`
+
+Now, retrieving information about regulatory features:
+
+```{r query_ensembl_reg, cache=TRUE}
+ensembl.reg <- useEnsembl( "regulation", dataset = "hsapiens_regulatory_feature", GRCh = 37 )
+all.attr <- listAttributes( ensembl.reg )
+all.filters <- listFilters( ensembl.reg )
+my.attrib.reg <- c( "chromosome_name", "chromosome_start", "regulatory_stable_id",
+    "feature_type_name", "feature_type_description", "so_name", "so_accession" )
+my.filters.reg <- "chromosomal_region"
+
+reg.info.found <- lapply( unique.snps, function(x){
+  cur.snp.row <- filter( var.info.found.df, refsnp_id == x )[1,]
+	cur.chr <- cur.snp.row$chr_name
+	cur.start <- as.numeric( cur.snp.row$chrom_start )
+	out <- getBM( attributes = my.attrib.reg, filters = my.filters.reg, values =
+		paste0( cur.chr, ":", cur.start, ":", cur.start + 1 ),
+		mart = ensembl.reg )
+	if( nrow( out ) == 0 ){
+		return( NA )
+	}
+	return( out )
+} )
+names( reg.info.found ) <- unique.snps
+reg.info.found <- lapply( unique.snps, function(x){
+  if( all( is.na( reg.info.found[[ x ]] ) ) ){
+    cur.snp.row <- filter( var.info.found.df, refsnp_id == x )[1,]
+    return( data.frame( refsnp_id = x,
+                        chromosome_name = cur.snp.row$chr_name,
+                        chromosome_start = as.numeric( cur.snp.row$chrom_start ),
+                        regulatory_stable_id = NA,
+                        feature_type_name = NA,
+                        feature_type_description = NA,
+                        so_name = NA, so_accession = NA ) )
+  }
+  return( cbind( refsnp_id = x, reg.info.found[[ x ]] ) )
+})
+
+reg.info.found.df <- do.call( rbind, reg.info.found )
+
+table( reg.info.found.df$so_name, useNA = "always" )
+```
+
+## Creating genomic ranges
+
+```{r gen_ranges}
+snps.all.granges.list <- sapply( 1:nrow( snps.all ), function(x){
+  cur.row <- snps.all[ x, ]
+  cur.var.info <- var.info.found[[ cur.row$SNP ]][1,]
+  GRanges( seqnames = Rle( paste0( "chr", cur.var.info$chr_name ) ),
+      ranges = IRanges( start = cur.var.info$chrom_start, end = cur.var.info$chrom_start + 1,
+            names = cur.row$SNP ),
+      SNP.name = cur.row$SNP, p.value = cur.row$p.value, env.factor = cur.row$env.factor,
+      population = cur.row$population )
+} )
+names( snps.all.granges.list ) <- snps.all$SNP
+# combine into one GRanges object:
+snps.all.granges <- Reduce( c, snps.all.granges.list )
+snps.all.granges
+```
+
+# Genome-wide overview
+
+```{r ggbio_kariotype_eu, fig.cap="Overview of SNPs location, EU population."}
+data( ideoCyto, package = "biovizBase" )
+
+# add seqlengths
+seqlengths( snps.all.granges ) <- seqlengths( ideoCyto$hg19 )[ 
+  names( seqlengths( snps.all.granges ) ) ]
+snps.all.granges <- keepSeqlevels( snps.all.granges, paste0( "chr", c( 1:19, 21 ) ) )
+
+snps.eu.granges <- snps.all.granges[ snps.all.granges$population == "European" ]
+snps.pooled.granges <- snps.all.granges[ snps.all.granges$population == "all" ]
+snps.asia.granges <- snps.all.granges[ snps.all.granges$population == "Asia" ]
+
+# # DOESN'T WORK:
+# 
+# snps.all.granges$start <- start( snps.all.granges )
+# autoplot( seqinfo( snps.all.granges ), layout = "karyogram" ) +
+#   layout_karyogram( data = snps.all.granges, geom = "point",
+#         aes( x = start, y = as.numeric( as.factor( env.factor ) )*10/3, color = env.factor, shape = as.factor( population ) ) )
+autoplot( snps.eu.granges, layout = "karyogram",
+    aes( color = env.factor, fill = env.factor ) )
+```
+
+```{r ggbio_kariotype_asia, fig.cap="Overview of SNPs location, Asia population."}
+autoplot( snps.asia.granges, layout = "karyogram",
+    aes( color = env.factor, fill = env.factor ) )
+```
+
+```{r ggbio_kariotype_pooled, fig.cap="Overview of SNPs location, pooled."}
+autoplot( snps.pooled.granges, layout = "karyogram",
+    aes( color = env.factor, fill = env.factor ) )
+```
+
+It doesn't seem like the SNPs cluster.
+
+# Features by genomic region
+
+## Combining information about regulatory features and genes
+
+```{r}
+ensembl.features <- full_join(
+  x = dplyr::select( reg.info.found.df,
+      refsnp_id, regulatory_stable_id, so_name ),
+  y = distinct( dplyr::select( var.info.found.df, 
+      refsnp_id, chr_name, chrom_start, ensembl_gene_stable_id, external_gene_name ),
+      .keep_all = TRUE ),
+  by = c( "refsnp_id" = "refsnp_id" )
+  )
+snps.only.in.genes <- is.na( ensembl.features$regulatory_stable_id ) &
+  !is.na( ensembl.features$ensembl_gene_stable_id )
+ensembl.features$so_name[ snps.only.in.genes ] <- "gene"
+names( ensembl.features )[ names( ensembl.features ) == "so_name" ] <- "feature_type"
+ensembl.features$chr_name <- as.integer( ensembl.features$chr_name )
+ensembl.features <- filter( ensembl.features, !is.na( chr_name ) )
+```
+
+How many SNPs are in a gene or a regulatory region?
+
+```{r}
+ensembl.feat.stats <- group_by( ensembl.features, chr_name, feature_type ) %>%
+  summarise( count = n() )
+options( tibble.print_max = 70 )
+print( ensembl.feat.stats )
+options( tibble.print_max = 10 )
+```
+
+## Plotting
+
+```{r ensembl_stat_plot,fig.width=10}
+ensembl.stat.plot <- ggplot( ensembl.feat.stats, aes( as.factor( chr_name ), count ) )
+ensembl.stat.plot +
+  geom_col( position = "dodge", aes( fill = as.factor( feature_type ) ) ) +
+  scale_fill_discrete( name = "feature" ) +
+  labs( x = "chromosome" ) +
+  theme( legend.position = "bottom" )
+```
+
+<!-- # Enrichment analysis -->
+
+<!-- ```{r enrichment_GO,fig.cap="Enrichment of GO terms from 'Biological process' ontology; unadjusted p-values."} -->
+<!-- all.ids <- c( var.info.found.df$ensembl_gene_stable_id, var.info.found.df$reg_feature_stable_id ) -->
+
+<!-- # unadjusted p-values -->
+<!-- ego1 <- enrichGO( gene = all.ids, OrgDb = org.Hs.eg.db, keyType = 'ENSEMBL', ont = "BP", -->
+<!--     pAdjustMethod = "none", readable = TRUE ) -->
+<!-- barplot( ego1, showCategory = 8 ) -->
+<!-- ego2 <- enrichGO( gene = all.ids, OrgDb = org.Hs.eg.db, keyType = 'ENSEMBL', ont = "BP", -->
+<!--     pAdjustMethod = "bonferroni", readable = TRUE ) -->
+<!-- ``` -->
+
+<!-- Unfortunately, there is no enrichment when p-values are adjusted for multiple testing (Bonferroni). -->
+
+# Hetionet querying
+
+## Trying with the most significant result from the manuscript:
+
+```
+MATCH path = allShortestPaths((node1:Gene {name: 'ARHGEF10'})-[*..3]-(node2:Disease {identifier: "DOID:0050741"}))
+WITH relationships(path) AS rels
+UNWIND rels AS rel
+RETURN
+DISTINCT startNode(rel) AS source, endNode(rel) AS target, rel AS relationship
+UNION
+MATCH path = allShortestPaths((node1:Gene {name: 'ARHGEF10'})-[*..2]-(node2:Disease {name: 'cleft lip'}))
+WITH relationships(path) AS rels UNWIND rels AS rel
+RETURN
+DISTINCT startNode(rel) AS source, endNode(rel) AS target, rel AS relationship
+
+```
+
+![Hetionet result for the query above.](hetionet_query_ARHGEF10-alcohol-dependence-cleft-lip.png)
+
+
+## Getting all the genes associated with 'alcohol dependence'
+
+Data from OpenTargets: https://www.targetvalidation.org/disease/EFO_0003829/associations?fcts=datatype:genetic_association (alcohol dependence defined as EFO_0003829 or DOID:0050741)
+
+```{r}
+targets.alcohol.dep <- read.csv( "targets_associated_with_alcohol_dependence.csv" )
+head( targets.alcohol.dep, n = 10 )
+```
+
+I will take the first 6, since the score is higher than 0.5 for those. 
+
+```{r}
+targets.alcohol.dep$target.gene_info.symbol[ 1:6 ]
+```
+
+Thus, the query will be:
+
+```
+MATCH path = allShortestPaths((node1:Gene {name: 'ARHGEF10'})-[*..2]-(node2:Gene))
+WHERE node2.name IN ["ALDH2","ADH1B","GABRG1","OXTR","SCN10A","ADH1C"]
+WITH relationships(path) AS rels
+UNWIND rels AS rel
+RETURN
+DISTINCT startNode(rel) AS source, endNode(rel) AS target, rel AS relationship
+UNION
+MATCH path = allShortestPaths((node1:Gene {name: 'ARHGEF10'})-[*..2]-(node2:Disease {name: 'cleft lip'}))
+WITH relationships(path) AS rels UNWIND rels AS rel
+RETURN
+DISTINCT startNode(rel) AS source, endNode(rel) AS target, rel AS relationship
+```
+
+![Hetionet result for the query above.](hetionet_query_ARHGEF10-genes-assoc-alcoh-dep-cleft-lip.png)
+
+## Taking all the genes in PoOxAlcohol, EU
+
+```{r}
+dplyr::filter( ensembl.features, refsnp_id %in% snps.eu.alcohol$V1 &
+      !is.na( ensembl_gene_stable_id ) & feature_type == "gene" & !is.na( external_gene_name ) )
+```
+
+Query:
+
+```
+MATCH path = allShortestPaths((node1:Gene)-[*..2]-(node2:Disease {identifier: "DOID:0050741"}))
+WHERE node1.name IN ["ARHGEF10","GLIS3","CCDC38","LRRC72","DLGAP2","CYP46A1","EHF","DLGAP1","UBE2B"]
+WITH relationships(path) AS rels
+UNWIND rels AS rel
+RETURN DISTINCT startNode(rel) AS source, endNode(rel) AS target, rel AS relationship
+UNION
+MATCH path = allShortestPaths((node1:Gene)-[*..2]-(node2:Disease {name: 'cleft lip'}))
+WHERE node1.name IN ["ARHGEF10","GLIS3","CCDC38","LRRC72","DLGAP2","CYP46A1","EHF","DLGAP1","UBE2B"]
+WITH relationships(path) AS rels
+UNWIND rels AS rel
+RETURN DISTINCT startNode(rel) AS source, endNode(rel) AS target, rel AS relationship
+```
+
+![Hetionet result for the query above.](hetionet_query_alcohol-dependence-cleft-lip-genes-EU-alcohol.png)
+
+### Network analysis
+
+```{r hetionet_read_in}
+# read the network from JSON file
+hetionet.network.json <- fromJSON( file =
+      "hetionet_query_alcohol-dependence-cleft-lip-genes-EU-alcohol_OUT.json" )
+# extract "segments"
+keys <- hetionet.network.json[[ 1 ]]$keys
+hetionet.segments <- lapply( hetionet.network.json, function(x){
+  x$`_fields`
+})
+
+# create data.frames
+# i <- 1
+which.start.node <- which( keys == "source" )
+which.end.node <- which( keys == "target" )
+which.edge <- which( keys == "relationship" )
+
+hetionet.segments.df.list <- lapply( hetionet.segments, function(x){
+  nodes <- dplyr::bind_rows( as.data.frame( x[[ which.start.node ]], stringsAsFactors = FALSE ),
+                             as.data.frame( x[[ which.end.node ]], stringsAsFactors = FALSE ) )
+
+  edges <- as.data.frame( x[[ which.edge ]], stringsAsFactors = FALSE )
+  # i <<- i+1
+  return( list( nodes = nodes, edges = edges ) )
+})
+
+# merge data.frames
+all.edges <- lapply( hetionet.segments.df.list, function(x){
+  x$edges
+} )
+all.edges.df <- Reduce( dplyr::bind_rows, all.edges )
+# head( all.edges.df )
+# all( all.edges.df$identity.high == 0 )
+# all( all.edges.df$start.high == 0 )
+# all( all.edges.df$end.high == 0 )
+
+all.edges.df <- dplyr::select( all.edges.df, -dplyr::matches( ".high" ) )
+
+# remove duplicates - those edges have e.g., multiple evidence from different databases
+which.edges.dupl <- duplicated( all.edges.df$identity.low )
+if( any( which.edges.dupl ) ){
+  ids.edges.dupl <- all.edges.df$identity.low[ which.edges.dupl ]
+  edges.dupl.merged <- lapply( ids.edges.dupl, function( id ){
+    edges.dupl <- filter( all.edges.df, identity.low == id )
+    which.differ <- which( !sapply( edges.dupl, function(x){ identical( x[1], x[2] )} ) )
+    merged <- paste( edges.dupl[ , which.differ ], collapse = "," )
+    out <- edges.dupl[ 1, ]
+    out[ ,which.differ ] <- merged
+    return( out )
+  } )
+  edges.dupl.merged <- do.call( rbind, edges.dupl.merged )
+  all.edges.no.dupl <- filter( all.edges.df, !identity.low %in% ids.edges.dupl )
+  all.edges.df <- bind_rows( all.edges.no.dupl, edges.dupl.merged )
+}
+
+all.nodes <- lapply( hetionet.segments.df.list, function(x){
+  x$nodes
+} )
+all.nodes.df <- Reduce( dplyr::bind_rows, all.nodes )
+# head( all.nodes.df )
+# all( all.nodes.df$identity.high == 0 )
+# all( all.nodes.df$properties.identifier.high %in% c( 0, NA ) )
+
+all.nodes.df <- dplyr::select( all.nodes.df, -dplyr::matches( ".high" ) )
+# remove duplicates - those edges have e.g., multiple evidence from different databases
+all.nodes.df.dupl <- all.nodes.df
+all.nodes.df <- distinct( all.nodes.df.dupl )
+```
+
+Altogether, there were `r nrow( all.edges.df )` relationships and `r nrow( all.nodes.df )` nodes.
+
+(@) Are there nodes common for all three parts (i.e., one of the genes in the gene list, "cleft lip", and "alcohol dependence")?
+
+```{r hetionet_common_nodes_all}
+genes.in <- dplyr::filter( ensembl.features, refsnp_id %in% snps.eu.alcohol$V1 &
+      !is.na( ensembl_gene_stable_id ) & feature_type == "gene" &
+        !is.na( external_gene_name ) ) %>% dplyr::select( external_gene_name )
+genes.in <- unique( genes.in[ ,, drop = TRUE ] )
+which.nodes.genes.in <- distinct( dplyr::filter( all.nodes.df, properties.name %in% genes.in &
+    labels == "Gene" ) )
+
+# all the edges starting or ending in those nodes:
+edges.genes.in <- filter( all.edges.df,
+    ( start.low %in% which.nodes.genes.in$identity.low | end.low %in% which.nodes.genes.in$identity.low ) &
+    !( start.low %in% which.nodes.genes.in$identity.low & end.low %in% which.nodes.genes.in$identity.low ) )
+# nodes connected to the genes, but distinct from those genes:
+all.nodes.genes.in <- unique( c( edges.genes.in$start.low, edges.genes.in$end.low ) )
+ids.neighbors.genes <- all.nodes.genes.in[ !( all.nodes.genes.in %in% which.nodes.genes.in$identity.low ) ]
+
+# all the edges starting or ending in "cleft lip":
+which.node.cleft.lip <- distinct( dplyr::filter( all.nodes.df, properties.name == "cleft lip" ) )
+edges.cleft.lip <- filter( all.edges.df, start.low == which.node.cleft.lip$identity.low |
+      end.low == which.node.cleft.lip$identity.low )
+# nodes directly connected to "cleft lip"
+all.nodes.cleft.lip <- unique( c( edges.cleft.lip$start.low, edges.cleft.lip$end.low ) )
+ids.neighbors.cleft.lip <- all.nodes.cleft.lip[ all.nodes.cleft.lip != which.node.cleft.lip$identity.low ]
+
+# all the edges starting or ending in "alcohol dependence":
+which.node.alc.dep <- distinct( dplyr::filter( all.nodes.df, properties.name == "alcohol dependence" ) )
+edges.alc.dep <- filter( all.edges.df, start.low == which.node.alc.dep$identity.low |
+      end.low == which.node.alc.dep$identity.low )
+# nodes directly connected to "alcohol dependence"
+all.nodes.alc.dep <- unique( c( edges.alc.dep$start.low, edges.alc.dep$end.low ) )
+ids.neighbors.alc.dep <- all.nodes.alc.dep[ all.nodes.alc.dep != which.node.alc.dep$identity.low ]
+
+# common nodes:
+nodes.common.all <- intersect( 
+  intersect( ids.neighbors.alc.dep, ids.neighbors.cleft.lip ),
+  ids.neighbors.genes )
+```
+
+There are `r length( nodes.common.all )` nodes common to all three parts.
+
+(@) This is the shortest path from "cleft lip" to "alcohol dependence":
+
+```{r shortest-path}
+# creating a graph object, using ggraph
+edges.for.graph <- select( all.edges.df, from = start.low, to = end.low,
+  everything() )
+my.ggraph <- as_tbl_graph( edges.for.graph )
+
+shortest.path.ggraph <- convert( my.ggraph, to_shortest_path,
+  from = which( .N() == which.node.cleft.lip$identity.low ),
+  to = which( .N() == which.node.alc.dep$identity.low ), mode = "all", .select = 1 )
+
+ggraph( shortest.path.ggraph, layout = "mds" ) +
+  geom_edge_arc( aes( label = type ), arrow = arrow( length = unit(4, 'mm') ),
+                   end_cap = circle(3, 'mm') ) +
+  geom_node_label( aes( 
+    label = all.nodes.df$properties.name[ match( name, all.nodes.df$identity.low ) ] ) )
+```
+
+There are many other shortest paths... Let's re-draw using weights for edges:
+
+* "UPREGULATES_AuG", "DOWNREGULATES_AdG", "UPREGULATES_DuG", "DOWNREGULATES_DdG" get the heighest weight,
+* "REGULATES_GrG", "EXPRESSES_AeG" get the middle weight, and
+* "COVARIES_GcG" get the lowest weight (this edge basically means that the two genes have similar evolutionary histories, which is a proxy for being co-dependent, but still it's just a proxy)
+
+```{r shortest-path2}
+edges.for.graph.weighted <- select( all.edges.df, from = start.low, to = end.low,
+  everything() )
+edges.for.graph.weighted$edge.weight <- 3
+edges.for.graph.weighted$edge.weight[ 
+  edges.for.graph.weighted$type %in% c( "REGULATES_GrG", "EXPRESSES_AeG" ) ] <- 2
+edges.for.graph.weighted$edge.weight[ 
+  edges.for.graph.weighted$type %in% c( "UPREGULATES_AuG", "DOWNREGULATES_AdG",
+                                        "UPREGULATES_DuG", "DOWNREGULATES_DdG" ) ] <- 1
+edges.for.graph.weighted$edge.weight[
+  edges.for.graph.weighted$properties.source == "MEDLINE cooccurrence" ] <- 3
+my.ggraph <- as_tbl_graph( edges.for.graph.weighted )
+
+shortest.path.ggraph <- convert( my.ggraph, to_shortest_path,
+  from = which( .N() == which.node.cleft.lip$identity.low ),
+  to = which( .N() == which.node.alc.dep$identity.low ), mode = "all",
+  weights = edge.weight, .select = 1 )
+ggraph( shortest.path.ggraph, layout = "mds" ) +
+  geom_edge_arc( aes( label = type ), arrow = arrow( length = unit(4, 'mm') ),
+                   end_cap = circle(3, 'mm') ) +
+  geom_node_label( aes( 
+    label = all.nodes.df$properties.name[ match( name, all.nodes.df$identity.low ) ] ) )
+```
+
+(@) How many of the genes share their neighbourhood nodes?
+
+```{r neighborhood}
+# finding all the neighbors and counting in how many neighborhoods each of them appears
+nodes.from.graph <- with_graph( my.ggraph, .N() )
+neighborhood.graph.list <- with_graph( my.ggraph, local_members( mindist = 1 ) )
+names( neighborhood.graph.list ) <- nodes.from.graph$name
+all.neighbors.count <- sapply( 
+  neighborhood.graph.list[ as.character( which.nodes.genes.in$identity.low ) ], function(l){
+    return( ids.neighbors.genes %in% as.numeric( nodes.from.graph[ l, ]$name ) )
+} )
+colnames( all.neighbors.count ) <- genes.in
+all.neighbors.count <- as.data.frame( all.neighbors.count, stringsAsFactors = FALSE )
+all.neighbors.count$sum <- rowSums( all.neighbors.count )
+all.neighbors.count$id <- ids.neighbors.genes
+all.neighbors.count$node.name <-
+  filter( all.nodes.df, identity.low %in% ids.neighbors.genes ) %>%
+  select( properties.name ) %>% pull()
+all.neighbors.count <- arrange( all.neighbors.count, desc( sum ) )
+```
+
+Here are the neighboring nodes to the genes, along with the number of genes that point to those:
+
+```{r}
+all.neighbors.count[, c("sum", "node.name")]
+```
+
+(@) What is the shortest path going from "cleft lip" to "nicotine dependence" through one of those most shared nodes? (using the weighted edges, as above)
+
+```{r shortest-path3}
+shortest.path.alc.dep1 <- convert( my.ggraph, to_shortest_path,
+  from = which( .N() == all.neighbors.count$id[ 1 ] ),
+  to = which( .N() == which.node.alc.dep$identity.low ), mode = "all",
+  weights = edge.weight, .select = 1 )
+# ggraph( shortest.path.alc.dep1, layout = "mds" ) +
+#   geom_edge_arc( aes( label = type ), arrow = arrow( length = unit(4, 'mm') ),
+#                    end_cap = circle(3, 'mm') ) +
+#   geom_node_label( aes( 
+#     label = all.nodes.df$properties.name[ match( name, all.nodes.df$identity.low ) ] ) )
+
+shortest.path.cleft.lip1 <- convert( my.ggraph, to_shortest_path,
+  from = which( .N() == all.neighbors.count$id[ 1 ] ),
+  to = which( .N() == which.node.cleft.lip$identity.low ), mode = "all",
+  weights = edge.weight, .select = 1 )
+# ggraph( shortest.path.cleft.lip1, layout = "mds" ) +
+#   geom_edge_arc( aes( label = type ), arrow = arrow( length = unit(4, 'mm') ),
+#                    end_cap = circle(3, 'mm') ) +
+#   geom_node_label( aes( 
+#     label = all.nodes.df$properties.name[ match( name, all.nodes.df$identity.low ) ] ) )
+
+ggraph( graph_join( shortest.path.cleft.lip1, shortest.path.alc.dep1 ), layout = "mds" ) +
+  geom_edge_arc( aes( label = type ), arrow = arrow( length = unit(4, 'mm') ),
+                   end_cap = circle(3, 'mm') ) +
+  geom_node_label( aes( 
+    label = all.nodes.df$properties.name[ match( name, all.nodes.df$identity.low ) ] ) )
+```
+
+## Taking all the genes in PoOxSmoke, EU
+
+```{r}
+dplyr::filter( ensembl.features, refsnp_id %in% snps.eu.smoke$V1 &
+      !is.na( ensembl_gene_stable_id ) & feature_type == "gene" & !is.na( external_gene_name ) )
+```
+
+Query:
+
+```
+MATCH path = allShortestPaths((node1:Gene)-[*..2]-(node2:Disease))
+WHERE node1.name IN ["LYZL1","ANK3","SHKBP1","MAPK10","TMEM108","AGBL1","PELI2","ZBTB7C","PDGFD","GMDS"]
+and node2.name STARTS WITH "nicotine"
+WITH relationships(path) AS rels
+UNWIND rels AS rel
+RETURN DISTINCT startNode(rel) AS source, endNode(rel) AS target, rel AS relationship
+UNION
+MATCH path = allShortestPaths((node1:Gene)-[*..2]-(node2:Disease {name: 'cleft lip'}))
+WHERE node1.name IN ["LYZL1","ANK3","SHKBP1","MAPK10","TMEM108","AGBL1","PELI2","ZBTB7C","PDGFD","GMDS"]
+WITH relationships(path) AS rels
+UNWIND rels AS rel
+RETURN DISTINCT startNode(rel) AS source, endNode(rel) AS target, rel AS relationship
+```
+
+![Hetionet result for the query above.](hetionet_query_nicotine-dependence-cleft-lip-genes-EU-smoke.png)
+
+### Network analysis
+
+```{r hetionet_read_in_smoke}
+# read the network from JSON file
+hetionet.network.json.smoke <- fromJSON( file =
+      "hetionet_query_nicotine-dependence-cleft-lip-genes-EU-smoke_OUT.json" )
+# extract "segments"
+keys <- hetionet.network.json[[ 1 ]]$keys
+hetionet.segments.smoke <- lapply( hetionet.network.json.smoke, function(x){
+  x$`_fields`
+})
+
+# create data.frames
+hetionet.segments.smoke.df.list <- lapply( hetionet.segments.smoke, function(x){
+  nodes <- dplyr::bind_rows( as.data.frame( x[[ which.start.node ]], stringsAsFactors = FALSE ),
+                             as.data.frame( x[[ which.end.node ]], stringsAsFactors = FALSE ) )
+
+  edges <- as.data.frame( x[[ which.edge ]], stringsAsFactors = FALSE )
+  # i <<- i+1
+  return( list( nodes = nodes, edges = edges ) )
+})
+
+# merge data.frames
+all.edges.smoke <- lapply( hetionet.segments.smoke.df.list, function(x){
+  x$edges
+} )
+all.edges.smoke.df <- Reduce( dplyr::bind_rows, all.edges.smoke )
+# head( all.edges.smoke.df )
+# all( all.edges.smoke.df$identity.high == 0 )
+# all( all.edges.smoke.df$start.high == 0 )
+# all( all.edges.smoke.df$end.high == 0 )
+
+all.edges.smoke.df <- dplyr::select( all.edges.smoke.df, -dplyr::matches( ".high" ) )
+
+# remove duplicates - those edges have e.g., multiple evidence from different databases
+which.edges.smoke.dupl <- duplicated( all.edges.smoke.df$identity.low )
+if( any( which.edges.smoke.dupl ) ){
+  ids.edges.smoke.dupl <- all.edges.smoke.df$identity.low[ which.edges.smoke.dupl ]
+  edges.smoke.dupl.merged <- lapply( ids.edges.smoke.dupl, function( id ){
+    edges.smoke.dupl <- filter( all.edges.smoke.df, identity.low == id )
+    which.differ <- which( !sapply( edges.smoke.dupl, function(x){ identical( x[1], x[2] )} ) )
+    merged <- paste( edges.smoke.dupl[ , which.differ ], collapse = "," )
+    out <- edges.smoke.dupl[ 1, ]
+    out[ ,which.differ ] <- merged
+    return( out )
+  } )
+  edges.smoke.dupl.merged <- do.call( rbind, edges.smoke.dupl.merged )
+  all.edges.smoke.no.dupl <- filter( all.edges.smoke.df, !identity.low %in% ids.edges.smoke.dupl )
+  all.edges.smoke.df <- bind_rows( all.edges.smoke.no.dupl, edges.smoke.dupl.merged )
+}
+
+all.nodes.smoke <- lapply( hetionet.segments.smoke.df.list, function(x){
+  x$nodes
+} )
+all.nodes.smoke.df <- Reduce( dplyr::bind_rows, all.nodes.smoke )
+# head( all.nodes.smoke.df )
+# all( all.nodes.smoke.df$identity.high == 0 )
+# all( all.nodes.smoke.df$properties.identifier.high %in% c( 0, NA ) )
+
+all.nodes.smoke.df <- dplyr::select( all.nodes.smoke.df, -dplyr::matches( ".high" ) )
+# remove duplicates - those edges have e.g., multiple evidence from different databases
+all.nodes.smoke.df.dupl <- all.nodes.smoke.df
+all.nodes.smoke.df <- distinct( all.nodes.smoke.df.dupl )
+```
+
+Altogether, there were `r nrow( all.edges.smoke.df )` relationships and `r nrow( all.nodes.smoke.df )` nodes.
+
+(@) Are there nodes common for all three parts (i.e., one of the genes in the gene list, "cleft lip", and "alcohol dependence")?
+
+```{r hetionet_common_nodes_all_smoke}
+genes.in.smoke <- dplyr::filter( ensembl.features, refsnp_id %in% snps.eu.smoke$V1 &
+      !is.na( ensembl_gene_stable_id ) & feature_type == "gene" &
+        !is.na( external_gene_name ) ) %>% dplyr::select( external_gene_name )
+genes.in.smoke <- unique( genes.in.smoke[ ,, drop = TRUE ] )
+which.nodes.genes.in.smoke <- distinct( dplyr::filter( all.nodes.smoke.df,
+    properties.name %in% genes.in.smoke & labels == "Gene" ) )
+
+# all the edges starting or ending in those nodes:
+edges.genes.in.smoke <- filter( all.edges.smoke.df,
+    ( start.low %in% which.nodes.genes.in.smoke$identity.low | end.low %in% which.nodes.genes.in.smoke$identity.low ) &
+    !( start.low %in% which.nodes.genes.in.smoke$identity.low & end.low %in% which.nodes.genes.in.smoke$identity.low ) )
+# nodes connected to the genes, but distinct from those genes:
+all.nodes.genes.in.smoke <- unique( c( edges.genes.in.smoke$start.low,
+                                       edges.genes.in.smoke$end.low ) )
+ids.neighbors.smoke.genes <- all.nodes.genes.in.smoke[ !( all.nodes.genes.in.smoke %in% which.nodes.genes.in.smoke$identity.low ) ]
+
+# all the edges starting or ending in "cleft lip":
+which.node.smoke.cleft.lip <- distinct( dplyr::filter( 
+  all.nodes.smoke.df, properties.name == "cleft lip" ) )
+edges.cleft.lip.smoke <- filter( all.edges.smoke.df,
+      start.low == which.node.smoke.cleft.lip$identity.low |
+      end.low == which.node.smoke.cleft.lip$identity.low )
+# nodes directly connected to "cleft lip"
+all.nodes.smoke.cleft.lip <- unique( c( edges.cleft.lip.smoke$start.low,
+                                        edges.cleft.lip.smoke$end.low ) )
+ids.neighbors.smoke.cleft.lip <- all.nodes.smoke.cleft.lip[ 
+  all.nodes.smoke.cleft.lip != which.node.smoke.cleft.lip$identity.low ]
+
+# all the edges starting or ending in "alcohol dependence":
+which.node.smoke.nicot.dep <- distinct( dplyr::filter( all.nodes.smoke.df, properties.name == "nicotine dependence" ) )
+edges.nicot.dep.smoke <- filter( all.edges.smoke.df,
+      start.low == which.node.smoke.nicot.dep$identity.low |
+      end.low == which.node.smoke.nicot.dep$identity.low )
+# nodes directly connected to "alcohol dependence"
+all.nodes.smoke.nicot.dep <- unique( c( edges.nicot.dep.smoke$start.low,
+                                      edges.nicot.dep.smoke$end.low ) )
+ids.neighbors.smoke.nicot.dep <- all.nodes.smoke.nicot.dep[ 
+  all.nodes.smoke.nicot.dep != which.node.smoke.nicot.dep$identity.low ]
+
+# common nodes:
+nodes.common.all.smoke <- intersect( 
+  intersect( ids.neighbors.smoke.nicot.dep, ids.neighbors.smoke.cleft.lip ),
+  ids.neighbors.smoke.genes )
+```
+
+There are `r length( nodes.common.all )` nodes common to all three parts.
+
+(@) This is the shortest path from "cleft lip" to "nicotine dependence":
+
+```{r shortest-path_smoke}
+# creating a graph object, using ggraph
+edges.for.graph.smoke <- select( all.edges.smoke.df, from = start.low, to = end.low,
+  everything() )
+my.ggraph.smoke <- as_tbl_graph( edges.for.graph.smoke )
+
+shortest.path.ggraph.smoke <- convert( my.ggraph.smoke, to_shortest_path,
+  from = which( .N() == which.node.smoke.cleft.lip$identity.low ),
+  to = which( .N() == which.node.smoke.nicot.dep$identity.low ), mode = "all", .select = 1 )
+
+ggraph( shortest.path.ggraph.smoke, layout = "mds" ) +
+  geom_edge_arc( aes( label = type ), arrow = arrow( length = unit(4, 'mm') ),
+                   end_cap = circle(3, 'mm') ) +
+  geom_node_label( aes( 
+    label = all.nodes.smoke.df$properties.name[ 
+      match( name, all.nodes.smoke.df$identity.low ) ] ) )
+```
+
+There are many other shortest paths... Let's re-draw using weights for edges:
+
+* "ASSOCIATES_DaG" (this means that there is a GWAS association) and "INTERACTS_GiG" (interaction based on the literature evidence) get the highest weight,
+* "UPREGULATES_AuG", "DOWNREGULATES_AdG", "UPREGULATES_DuG", "DOWNREGULATES_DdG" get the second heighest weight,
+* "REGULATES_GrG", "EXPRESSES_AeG" get the middle weight, and
+* "COVARIES_GcG" get the lowest weight (this edge basically means that the two genes have similar evolutionary histories, which is a proxy for being co-dependent, but still it's just a proxy)
+
+```{r shortest-path2_smoke}
+edges.for.graph.smoke.weighted <- select( all.edges.smoke.df, from = start.low,
+    to = end.low, everything() )
+edges.for.graph.smoke.weighted$edge.weight <- 4
+edges.for.graph.smoke.weighted$edge.weight[ 
+  edges.for.graph.smoke.weighted$type %in% c( "REGULATES_GrG", "EXPRESSES_AeG" ) ] <- 3
+edges.for.graph.smoke.weighted$edge.weight[ 
+  edges.for.graph.smoke.weighted$type %in% c( "UPREGULATES_AuG", "DOWNREGULATES_AdG",
+                                        "UPREGULATES_DuG", "DOWNREGULATES_DdG" ) ] <- 2
+edges.for.graph.smoke.weighted$edge.weight[ 
+  edges.for.graph.smoke.weighted$type %in% c( "ASSOCIATES_DaG", "INTERACTS_GiG" ) ] <- 1
+edges.for.graph.smoke.weighted$edge.weight[
+  edges.for.graph.smoke.weighted$properties.source == "MEDLINE cooccurrence" ] <- 4
+my.ggraph.smoke <- as_tbl_graph( edges.for.graph.smoke.weighted )
+
+shortest.path.ggraph.smoke <- convert( my.ggraph.smoke, to_shortest_path,
+  from = which( .N() == which.node.smoke.cleft.lip$identity.low ),
+  to = which( .N() == which.node.smoke.nicot.dep$identity.low ), mode = "all",
+  weights = edge.weight, .select = 1 )
+ggraph( shortest.path.ggraph.smoke, layout = "mds" ) +
+  geom_edge_arc( aes( label = type ), arrow = arrow( length = unit(4, 'mm') ),
+                   end_cap = circle(3, 'mm') ) +
+  geom_node_label( aes( 
+    label = all.nodes.smoke.df$properties.name[
+      match( name, all.nodes.smoke.df$identity.low ) ] ) )
+```
+
+(@) How many of the genes share their neighbourhood nodes?
+
+```{r neighborhood_smoke}
+# finding all the neighbors and counting in how many neighborhoods each of them appears
+nodes.from.graph.smoke <- with_graph( my.ggraph.smoke, .N() )
+neighborhood.graph.smoke.list <- with_graph( my.ggraph.smoke, local_members( mindist = 1 ) )
+names( neighborhood.graph.smoke.list ) <- nodes.from.graph.smoke$name
+all.neighbors.smoke.count <- sapply( 
+  neighborhood.graph.smoke.list[ as.character( which.nodes.genes.in.smoke$identity.low ) ], function(l){
+    return( ids.neighbors.smoke.genes %in% as.numeric( nodes.from.graph.smoke[ l, ]$name ) )
+} )
+colnames( all.neighbors.smoke.count ) <- which.nodes.genes.in.smoke$properties.name
+all.neighbors.smoke.count <- as.data.frame( all.neighbors.smoke.count, stringsAsFactors = FALSE )
+all.neighbors.smoke.count$sum <- rowSums( all.neighbors.smoke.count )
+all.neighbors.smoke.count$id <- ids.neighbors.smoke.genes
+all.neighbors.smoke.count$node.name <-
+  filter( all.nodes.smoke.df, identity.low %in% ids.neighbors.smoke.genes ) %>%
+  select( properties.name ) %>% pull()
+all.neighbors.smoke.count <- arrange( all.neighbors.smoke.count, desc( sum ) )
+```
+
+Here are the neighboring nodes to the genes, along with the number of genes that point to those:
+
+```{r}
+all.neighbors.smoke.count[, c("sum", "node.name")]
+```
+
+(@) What is the shortest path going from "cleft lip" to "nicotine dependence" through one of those most shared nodes? (using the weighted edges, as above)
+
+```{r shortest-path3_smoke}
+shortest.path.smoke.nicot.dep1 <- convert( my.ggraph.smoke, to_shortest_path,
+  from = which( .N() == all.neighbors.smoke.count$id[ 1 ] ),
+  to = which( .N() == which.node.smoke.nicot.dep$identity.low ), mode = "all",
+  weights = edge.weight, .select = 1 )
+# ggraph( shortest.path.smoke.nicot.dep1, layout = "mds" ) +
+#   geom_edge_arc( aes( label = type ), arrow = arrow( length = unit(4, 'mm') ),
+#                    end_cap = circle(3, 'mm') ) +
+#   geom_node_label( aes(
+#     label = all.nodes.smoke.df$properties.name[
+#       match( name, all.nodes.smoke.df$identity.low ) ] ) )
+
+shortest.path.smoke.cleft.lip1 <- convert( my.ggraph.smoke, to_shortest_path,
+  from = which( .N() == all.neighbors.smoke.count$id[ 1 ] ),
+  to = which( .N() == which.node.smoke.cleft.lip$identity.low ), mode = "all",
+  weights = edge.weight, .select = 1 )
+# ggraph( shortest.path.smoke.cleft.lip1, layout = "mds" ) +
+#   geom_edge_arc( aes( label = type ), arrow = arrow( length = unit(4, 'mm') ),
+#                    end_cap = circle(3, 'mm') ) +
+#   geom_node_label( aes(
+#     label = all.nodes.smoke.df$properties.name[
+#       match( name, all.nodes.smoke.df$identity.low ) ] ) )
+
+ggraph( graph_join( shortest.path.smoke.cleft.lip1, shortest.path.smoke.nicot.dep1 ),
+        layout = "mds" ) +
+  geom_edge_arc( aes( label = type ), arrow = arrow( length = unit(4, 'mm') ),
+                   end_cap = circle(3, 'mm') ) +
+  geom_node_label( aes( 
+    label = all.nodes.smoke.df$properties.name[
+      match( name, all.nodes.smoke.df$identity.low ) ] ) )
+```
+
+
+
+# Protein-protein interaction network
+
+## Genes from PoOxAlcohol, EU
+
+Querying STRING.db with the genes ARHGEF10, GLIS3, CCDC38, LRRC72, DLGAP2, CYP46A1, EHF, DLGAP1, UBE2B, gave the following output:
+
+![STRING PPI](STRING_network_genes_EU_alcohol.png)
+
+[Here is the network](https://version-11-0.string-db.org/cgi/network.pl?networkId=QHo4OmUrJdbe)
+
+## Genes from PoOxSmoke, EU
+
+Querying STRING.db with the genes PDGFD, ANK3, LYZL1, MAPK10, RP11-742B18.1, TMEM108, AGBL1-AS1, AGBL1, ZBTB7C, GMDS, gave the following output:
+
+![STRING PPI](STRING_network_genes_EU_smoke.png)
+
+[Here is the network](https://version-11-0.string-db.org/cgi/network.pl?networkId=s5g9jPvu1Xtz)
+
+
+# Gene set enrichment
+
+Querying ExpressionAtlas for enrichment didn't return any results.
+
+```
+ENSG00000111275,ENSG00000196616,ENSG00000163285,ENSG00000180914,
+ENSG00000185313,ENSG00000248144,ENSG00000104728
+```
+
+Querying Bgee (https://bgee.org/)
+
+1. First, checking the genes found for PoOxAlcohol, pooled results, with all embryonic-stage genes as the background:
+
+```{r bgee-enrich}
+# bgee.enrich.post.embryo <- read.csv( "topanat-all-5_21_2019_3_04_21_PM.tsv", sep = "\t" )
+# head( bgee.enrich.post.embryo )
+
+listBgeeSpecies()
+
+bgee <- Bgee$new( species = "Homo_sapiens", dataType = "rna_seq" )
+# embryonic stage only
+myTopAnatData <- loadTopAnatData( bgee, confidence = "silver", stage = "UBERON:0000068" )
+
+str( myTopAnatData )
+
+universe <- names( myTopAnatData$gene2anatomy )
+
+# Foreground genes
+myGenes <- dplyr::filter( ensembl.features, refsnp_id %in% snps.pooled.alcohol$V1 &
+      !is.na( ensembl_gene_stable_id ) ) %>% dplyr::select( ensembl_gene_stable_id )
+myGenes <- myGenes[ ,,drop = TRUE ]
+
+# Prepare the gene list vector 
+geneList <- factor( as.integer( unique( universe ) %in% myGenes ) )
+names( geneList ) <- unique( universe )
+summary( geneList )
+
+which.in.universe <- which( myGenes %in% unique( universe ) )
+myGenes[ which.in.universe ]
+(dplyr::filter( ensembl.features, ensembl_gene_stable_id %in% myGenes ) %>% 
+  dplyr::select( external_gene_name ))[ which.in.universe, ]
+
+myTopAnatObject <- topAnat( myTopAnatData, geneList )
+
+results <- runTest( myTopAnatObject, algorithm = 'weight', statistic = 'fisher' )
+```
+
+```{r}
+tableOver <- makeTable( myTopAnatData, myTopAnatObject, results, cutoff = 0.01 )
+```
+
+2. checking the genes found for PoOxSmoke, pooled results:
+
+```{r bgee-enrich2}
+# Foreground genes
+myGenes <- dplyr::filter( ensembl.features, refsnp_id %in% snps.pooled.smoke$V1 &
+      !is.na( ensembl_gene_stable_id ) ) %>% dplyr::select( ensembl_gene_stable_id )
+myGenes <- myGenes[ ,,drop = TRUE ]
+
+# Prepare the gene list vector 
+geneList <- factor( as.integer( unique( universe ) %in% myGenes ) )
+names( geneList ) <- unique( universe )
+summary( geneList )
+
+which.in.universe <- which( myGenes %in% unique( universe ) )
+myGenes[ which.in.universe ]
+(dplyr::filter( ensembl.features, ensembl_gene_stable_id %in% myGenes ) %>% 
+  dplyr::select( external_gene_name ))[ which.in.universe, ]
+
+myTopAnatObject <- topAnat( myTopAnatData, geneList )
+
+results <- runTest( myTopAnatObject, algorithm = 'weight', statistic = 'fisher' )
+```
+
+```{r}
+tableOver <- makeTable( myTopAnatData, myTopAnatObject, results, cutoff = 0.01 )
+```
+
+
+```{r}
+save( var.info.found.df, reg.info.found.df, file = "SNPs_all_ensembl_info.RData" )
+save.image( "post-analysis.RData" )
+```
+
